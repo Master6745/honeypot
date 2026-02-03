@@ -6,7 +6,7 @@ import os
 
 # --- CONFIGURATION ---
 # Note: In production, use os.getenv("OPENAI_API_KEY") for security
-OPENAI_API_KEY = "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" 
+OPENAI_API_KEY = "" 
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
