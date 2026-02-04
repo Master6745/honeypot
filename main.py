@@ -37,7 +37,10 @@ def extract_intelligence(text: str):
     intel["links"] = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+', text)
     intel["phone_numbers"] = re.findall(r'\b\d{10}\b', text)
     return intel
-
+# --- THE FRONT DOOR (Root Endpoint) ---
+@app.get("/")
+def home():
+    return {"status": "alive", "message": "Honeypot Agent is running! Send POST requests to /chat"}
 # --- THE ENDPOINT ---
 @app.post("/chat")
 async def chat_endpoint(request: Request, x_api_key: str = Header(None)):
