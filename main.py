@@ -1,41 +1,54 @@
-
 from dotenv import load_dotenv
-load_dotenv()  # This loads the keys from the .env filefrom fastapi import FastAPI, Header, HTTPException, Request
-from fastapi import FastAPI, HTTPException, Header, Request
+load_dotenv()  # This loads the keys from the .env file
+
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 from openai import OpenAI
-from pymongo import MongoClient # NEW: Database Tool
+from pymongo import MongoClient
 import re
 import os
 import json
-from datetime import datetime # NEW: For timestamps
+from datetime import datetime
 
 # --- CONFIGURATION ---
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- DATABASE CONNECTION ---
-# We get the link from Render settings (Environment Variables)
 MONGO_URI = os.environ.get("MONGO_URI") 
 
 # Safety check: If no DB link, we won't crash, we just won't save
 if MONGO_URI:
-    mongo_client = MongoClient(MONGO_URI)
-    db = mongo_client["honeypot_db"]     # Database Name
-    chat_collection = db["chat_logs"]    # Table Name
+    try:
+        mongo_client = MongoClient(MONGO_URI)
+        db = mongo_client["honeypot_db"]     # Database Name
+        chat_collection = db["chat_logs"]    # Table Name
+        print("SUCCESS: Connected to MongoDB")
+    except Exception as e:
+        chat_collection = None
+        print(f"WARNING: Database connection failed: {e}")
 else:
     chat_collection = None
-    print("WARNING: No Database Connected!")
+    print("WARNING: No MONGO_URI found. Logs will not be saved.")
 
 app = FastAPI()
+
+# --- THE FRONT DOOR (Root Endpoint) ---
+@app.get("/")
+def home():
+    return {"status": "alive", "message": "Honeypot Agent is running! Send POST requests to /chat"}
 
 # --- THE GATEKEEPER BRAIN ---
 SYSTEM_BRAIN_PROMPT = """
 You are a Dual-Core Security Agent.
-1. ANALYSIS: Check if message is Scam (Phishing, Financial, Tech Support, Job).
+1. ANALYSIS: Check if message is Scam (Phishing, Financial, Tech Support, Job, Romance).
 2. RESPONSE:
    - IF NOT SCAM: Reply "SAFE".
    - IF SCAM: Activate Persona (Ramesh/Riya/Vikram). Ask questions to get data.
+   - PERSONAS:
+     * Ramesh (Old, confused) -> Tech Support/Virus scams.
+     * Riya (Broke student) -> Job/Investment scams.
+     * Vikram (Suspicious shopkeeper) -> Lottery/Bank scams.
 
 OUTPUT JSON:
 {
@@ -67,7 +80,11 @@ async def chat_endpoint(request: Request, x_api_key: str = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     # 2. GET THE MESSAGE
-    body = await request.json()
+    try:
+        body = await request.json()
+    except:
+        return {"error": "Invalid JSON format"}
+        
     scammer_msg = body.get("message") or body.get("text") or body.get("input")
     
     if not scammer_msg:
@@ -91,8 +108,7 @@ async def chat_endpoint(request: Request, x_api_key: str = Header(None)):
         print(f"Error: {e}")
         return {"error": "AI Processing Failed"}
 
-    # 4. PREPARE THE LOG (What we will save)
-    # We save everything, even if we decide to ignore it
+    # 4. PREPARE THE LOG
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "scammer_message": scammer_msg,
@@ -105,17 +121,17 @@ async def chat_endpoint(request: Request, x_api_key: str = Header(None)):
     }
 
     # 5. LOGIC BRANCHING
+    
+    # PATH A: SAFE MESSAGE
     if not is_scam:
-        # Save to DB before returning
         if chat_collection is not None:
             chat_collection.insert_one(log_entry)
-            
         return {"status": "ignored", "reply": None}
 
-    # IF SCAM -> EXTRACT INTEL
+    # PATH B: SCAM DETECTED
     intelligence_data = extract_intelligence(scammer_msg)
     
-    # Update the Log with the extracted data
+    # Update Log
     log_entry["intelligence_extracted"] = intelligence_data
     log_entry["status"] = "engaged"
     
@@ -130,5 +146,5 @@ async def chat_endpoint(request: Request, x_api_key: str = Header(None)):
         "reply": ai_data["reply"],
         "intelligence": intelligence_data,
         "status": log_entry["status"],
-        "meta": {"saved_to_db": True}
+        "meta": {"saved_to_db": True if chat_collection else False}
     }
