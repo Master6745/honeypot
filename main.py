@@ -1,4 +1,7 @@
-from fastapi import FastAPI, Header, HTTPException, Request
+
+from dotenv import load_dotenv
+load_dotenv()  # This loads the keys from the .env filefrom fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 from openai import OpenAI
 from pymongo import MongoClient # NEW: Database Tool
