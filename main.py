@@ -1,25 +1,46 @@
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
-from openai import OpenAI 
+from openai import OpenAI
+from pymongo import MongoClient # NEW: Database Tool
 import re
 import os
+import json
+from datetime import datetime # NEW: For timestamps
 
 # --- CONFIGURATION ---
-# Note: In production, use os.getenv("OPENAI_API_KEY") for security
-OPENAI_API_KEY = "" 
-
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- DATABASE CONNECTION ---
+# We get the link from Render settings (Environment Variables)
+MONGO_URI = os.environ.get("MONGO_URI") 
+
+# Safety check: If no DB link, we won't crash, we just won't save
+if MONGO_URI:
+    mongo_client = MongoClient(MONGO_URI)
+    db = mongo_client["honeypot_db"]     # Database Name
+    chat_collection = db["chat_logs"]    # Table Name
+else:
+    chat_collection = None
+    print("WARNING: No Database Connected!")
+
 app = FastAPI()
 
-# --- THE PERSONA ---
-PERSONA_SYSTEM_PROMPT = """
-You are "Martha", a 74-year-old retired nurse. You are not tech-savvy.
-A scammer is messaging you. Your goal is to keep them talking to waste their time.
-- Act naive and slightly confused.
-- Ask how to send the money or open the link.
-- Make occasional typos.
-- NEVER admit you are an AI.
-- Keep your reply under 3 sentences.
+# --- THE GATEKEEPER BRAIN ---
+SYSTEM_BRAIN_PROMPT = """
+You are a Dual-Core Security Agent.
+1. ANALYSIS: Check if message is Scam (Phishing, Financial, Tech Support, Job).
+2. RESPONSE:
+   - IF NOT SCAM: Reply "SAFE".
+   - IF SCAM: Activate Persona (Ramesh/Riya/Vikram). Ask questions to get data.
+
+OUTPUT JSON:
+{
+  "is_scam": boolean,
+  "scam_type": "string",
+  "selected_persona": "string",
+  "reply": "string"
+}
 """
 
 # --- HELPER: Extract Data ---
@@ -29,18 +50,11 @@ def extract_intelligence(text: str):
         "links": [],
         "phone_numbers": []
     }
-    # Using a guard to ensure text is a string
-    if not text:
-        return intel
-        
     intel["upi_ids"] = re.findall(r'[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}', text)
     intel["links"] = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+', text)
     intel["phone_numbers"] = re.findall(r'\b\d{10}\b', text)
     return intel
-# --- THE FRONT DOOR (Root Endpoint) ---
-@app.get("/")
-def home():
-    return {"status": "alive", "message": "Honeypot Agent is running! Send POST requests to /chat"}
+
 # --- THE ENDPOINT ---
 @app.post("/chat")
 async def chat_endpoint(request: Request, x_api_key: str = Header(None)):
@@ -51,44 +65,67 @@ async def chat_endpoint(request: Request, x_api_key: str = Header(None)):
 
     # 2. GET THE MESSAGE
     body = await request.json()
-    
-    # Safely extract message with a fallback to an empty string
-    scammer_msg = body.get("message") or body.get("text") or body.get("input") or ""
+    scammer_msg = body.get("message") or body.get("text") or body.get("input")
     
     if not scammer_msg:
-        return {"error": "No message field found in JSON"}
+        return {"error": "No message found"}
 
-    # 3. ANALYZE (Extract Intel)
-    intelligence_data = extract_intelligence(scammer_msg)
-
-    # 4. GENERATE REPLY
+    # 3. ASK THE BRAIN
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": PERSONA_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Scammer said: '{scammer_msg}'. Reply as Martha:"}
+                {"role": "system", "content": SYSTEM_BRAIN_PROMPT},
+                {"role": "user", "content": f"Incoming Message: '{scammer_msg}'"}
             ],
-            max_tokens=100,
-            temperature=0.7
+            response_format={"type": "json_object"},
+            max_tokens=200,
+            temperature=1.0
         )
-        
-        # FIX: Pylance check. completion.choices[0].message.content can be None.
-        raw_content = completion.choices[0].message.content
-        bot_reply = raw_content.strip() if raw_content is not None else "Oh dear, I'm a bit confused."
-        
+        ai_data = json.loads(completion.choices[0].message.content)
+        is_scam = ai_data["is_scam"]
     except Exception as e:
-        print(f"OpenAI Error: {e}")
-        bot_reply = "Oh dear, I am having trouble with my internet connection."
+        print(f"Error: {e}")
+        return {"error": "AI Processing Failed"}
 
-    # 5. DETERMINE STATUS
-    status = "engaged"
+    # 4. PREPARE THE LOG (What we will save)
+    # We save everything, even if we decide to ignore it
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "scammer_message": scammer_msg,
+        "is_scam": is_scam,
+        "scam_type": ai_data.get("scam_type"),
+        "persona_used": ai_data.get("selected_persona"),
+        "bot_reply": ai_data.get("reply"),
+        "intelligence_extracted": {},
+        "status": "ignored"
+    }
+
+    # 5. LOGIC BRANCHING
+    if not is_scam:
+        # Save to DB before returning
+        if chat_collection is not None:
+            chat_collection.insert_one(log_entry)
+            
+        return {"status": "ignored", "reply": None}
+
+    # IF SCAM -> EXTRACT INTEL
+    intelligence_data = extract_intelligence(scammer_msg)
+    
+    # Update the Log with the extracted data
+    log_entry["intelligence_extracted"] = intelligence_data
+    log_entry["status"] = "engaged"
+    
     if intelligence_data["upi_ids"] or intelligence_data["links"]:
-        status = "intelligence_captured"
+        log_entry["status"] = "intelligence_captured"
 
-    # 6. RETURN JSON RESPONSE
+    # Save to DB
+    if chat_collection is not None:
+        chat_collection.insert_one(log_entry)
+
     return {
-        "reply": bot_reply,
+        "reply": ai_data["reply"],
         "intelligence": intelligence_data,
-        "status": status
+        "status": log_entry["status"],
+        "meta": {"saved_to_db": True}
     }
